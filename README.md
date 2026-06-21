@@ -10,8 +10,17 @@ ads503-hospital-readmission-prediction/
 │   ├── raw/          # Raw dataset files
 │   └── processed/    # Cleaned / intermediate data
 ├── R/                # Analysis scripts (EDA, preprocessing, modeling, evaluation)
-├── scripts/          # Setup and utility scripts
+├── scripts/
+│   └── install_packages.R   # Install required R packages
 └── README.md
+```
+
+## Setup
+
+Install required R packages (run once):
+
+```r
+source("scripts/install_packages.R")
 ```
 
 ## Authors
