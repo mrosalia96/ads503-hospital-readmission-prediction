@@ -1,0 +1,17 @@
+# Data
+data/raw/*
+!data/raw/.gitkeep
+data/processed/*
+!data/processed/.gitkeep
+
+# Generated outputs
+output/
+
+# R
+.Rhistory
+.RData
+*.Rproj
+*.Rproj.user/
+
+# OS
+.DS_Store
