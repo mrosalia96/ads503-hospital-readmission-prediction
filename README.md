@@ -11,7 +11,8 @@ ads503-hospital-readmission-prediction/
 │   └── processed/    # Cleaned / intermediate data
 ├── R/                # Analysis scripts (EDA, preprocessing, modeling, evaluation)
 ├── scripts/
-│   └── install_packages.R   # Install required R packages
+│   ├── install_packages.R   # Install required R packages
+│   └── download_data.R      # Download dataset from UCI
 └── README.md
 ```
 
@@ -22,6 +23,14 @@ Install required R packages (run once):
 ```r
 source("scripts/install_packages.R")
 ```
+
+Download the dataset:
+
+```r
+source("scripts/download_data.R")
+```
+
+Raw data is saved to `data/raw/` (not committed to Git).
 
 ## Authors
 
