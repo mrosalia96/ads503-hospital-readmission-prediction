@@ -9,7 +9,8 @@ ads503-hospital-readmission-prediction/
 ├── data/
 │   ├── raw/          # Raw dataset files
 │   └── processed/    # Cleaned / intermediate data
-├── R/                # Analysis scripts (EDA, preprocessing, modeling, evaluation)
+├── R/
+│   └── 01_eda.qmd           # Exploratory data analysis
 ├── scripts/
 │   ├── install_packages.R   # Install required R packages
 │   └── download_data.R      # Download dataset from UCI
@@ -31,6 +32,18 @@ source("scripts/download_data.R")
 ```
 
 Raw data is saved to `data/raw/` (not committed to Git).
+
+## Run the analysis
+
+Run the `.qmd` notebooks in the following order from the project root:
+
+1. `R/01_eda.qmd`
+
+```bash
+quarto render R/01_eda.qmd
+```
+
+Figures are saved to `output/figures/` (not committed to Git).
 
 ## Authors
 

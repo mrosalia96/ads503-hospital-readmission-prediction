@@ -11,7 +11,9 @@ required <- c(
   "yardstick",
   "themis",
   "scales",
-  "patchwork"
+  "patchwork",
+  "knitr",
+  "rmarkdown"
 )
 
 installed <- rownames(installed.packages())
