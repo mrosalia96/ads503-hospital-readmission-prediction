@@ -3,8 +3,6 @@
 
 required <- c(
   "tidyverse",
-  "tidymodels",
-  "recipes",
   "caret",
   "glmnet",
   "ranger",

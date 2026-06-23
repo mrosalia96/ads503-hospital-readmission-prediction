@@ -337,9 +337,11 @@ if (!is.null(best_model_obj)) {
 ## Final model selection
 
 ```{r final-selection}
-final_model_row <- test_metrics_all |> slice(1)
+final_model_row <- test_metrics_all |>
+  filter(model == best_model_name)
 
 cat("=== Final Selected Model ===\n")
+cat("(Selected on validation; test metrics reported below.)\n")
 cat("Model:       ", final_model_row$model, "\n")
 cat("Test ROC-AUC:", final_model_row$roc_auc, "\n")
 cat("Sensitivity: ", final_model_row$sens, "\n")
