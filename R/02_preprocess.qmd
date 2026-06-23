@@ -86,3 +86,181 @@ split_summary <- tibble(
 
 split_summary
 ```
+
+
+
+## Impute missing numeric and categorical values
+
+```{r step-impute}
+impute_from_train <- function(train, new_data) {
+  imputed <- new_data
+
+  for (col in names(train)) {
+    if (col == "readmit_30") {
+      next
+    }
+
+    if (is.numeric(train[[col]])) {
+      fill_value <- median(train[[col]], na.rm = TRUE)
+    } else {
+      fill_value <- names(sort(table(train[[col]]), decreasing = TRUE))[1]
+    }
+
+    imputed[[col]][is.na(imputed[[col]])] <- fill_value
+  }
+
+  imputed
+}
+
+train_imp <- impute_from_train(train_data, train_data)
+val_imp <- impute_from_train(train_data, val_data)
+test_imp <- impute_from_train(train_data, test_data)
+```
+
+
+
+## Remove zero-variance predictors
+
+```{r step-zv-1}
+remove_zero_var <- function(data) {
+  keep <- vapply(
+    data,
+    function(x) {
+      if (is.numeric(x)) {
+        var(x, na.rm = TRUE) > 0
+      } else {
+        length(unique(x[!is.na(x)])) > 1
+      }
+    },
+    logical(1)
+  )
+  data[, keep, drop = FALSE]
+}
+
+train_pred <- train_imp |> select(-readmit_30) |> remove_zero_var()
+keep_predictors <- colnames(train_pred)
+
+val_pred <- val_imp |> select(all_of(keep_predictors))
+test_pred <- test_imp |> select(all_of(keep_predictors))
+```
+
+
+
+## Remove highly correlated predictors
+
+```{r step-corr}
+numeric_cols <- names(train_pred)[vapply(train_pred, is.numeric, logical(1))]
+
+if (length(numeric_cols) > 1) {
+  high_corr <- findCorrelation(
+    cor(train_pred[, numeric_cols, drop = FALSE], use = "pairwise.complete.obs"),
+    cutoff = 0.9
+  )
+
+  if (length(high_corr) > 0) {
+    remove_cols <- numeric_cols[high_corr]
+    keep_predictors <- setdiff(keep_predictors, remove_cols)
+    train_pred <- train_pred[, keep_predictors, drop = FALSE]
+    val_pred <- val_pred[, keep_predictors, drop = FALSE]
+    test_pred <- test_pred[, keep_predictors, drop = FALSE]
+  }
+}
+```
+
+
+
+## One-hot encode categorical predictors
+
+```{r step-dummy}
+dummy_vars <- dummyVars(~ ., data = train_pred, fullRank = TRUE)
+
+train_x <- as.data.frame(predict(dummy_vars, train_pred))
+val_x <- as.data.frame(predict(dummy_vars, val_pred))
+test_x <- as.data.frame(predict(dummy_vars, test_pred))
+```
+
+
+
+## Remove zero-variance dummy columns
+
+```{r step-zv-2}
+non_zero_var <- vapply(train_x, function(x) var(x, na.rm = TRUE) > 0, logical(1))
+post_dummy_cols <- colnames(train_x)[non_zero_var]
+
+train_x <- train_x[, post_dummy_cols, drop = FALSE]
+val_x <- val_x[, post_dummy_cols, drop = FALSE]
+test_x <- test_x[, post_dummy_cols, drop = FALSE]
+```
+
+
+
+## Center and scale predictors
+
+```{r step-normalize}
+pre_process <- preProcess(train_x, method = c("center", "scale"))
+```
+
+
+
+## Fit preprocessor on training data
+
+```{r prep-preprocessor}
+train_processed <- as.data.frame(predict(pre_process, train_x))
+```
+
+
+
+## Apply preprocessor to train and test
+
+```{r bake-preprocessor}
+val_processed <- as.data.frame(predict(pre_process, val_x))
+test_processed <- as.data.frame(predict(pre_process, test_x))
+
+baked_train <- bind_cols(readmit_30 = train_imp$readmit_30, train_processed)
+baked_val <- bind_cols(readmit_30 = val_imp$readmit_30, val_processed)
+baked_test <- bind_cols(readmit_30 = test_imp$readmit_30, test_processed)
+
+cat("Features after preprocessing:", ncol(baked_train) - 1, "\n")
+```
+
+
+
+## Preprocessing summary
+
+```{r preprocess-summary}
+preprocess_summary <- tibble(
+  dataset = c("Train (processed)", "Validation (processed)", "Test (processed)"),
+  rows = c(nrow(baked_train), nrow(baked_val), nrow(baked_test)),
+  features = c(ncol(baked_train) - 1, ncol(baked_val) - 1, ncol(baked_test) - 1)
+)
+
+preprocess_summary
+
+cat(
+  "\nTest readmission rate (unchanged):",
+  scales::percent(mean(test_data$readmit_30 == "Yes"), accuracy = 0.1),
+  "\n"
+)
+```
+
+
+
+## Save splits and preprocessor
+
+```{r save}
+dir.create("data/processed", recursive = TRUE, showWarnings = FALSE)
+
+saveRDS(
+  list(
+    train = train_data,
+    validation = val_data,
+    test = test_data,
+    impute_from_train = impute_from_train,
+    keep_predictors = keep_predictors,
+    dummy_vars = dummy_vars,
+    post_dummy_cols = post_dummy_cols,
+    pre_process = pre_process
+  ),
+  "data/processed/splits_caret.rds"
+)
+```
