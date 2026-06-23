@@ -1,0 +1,377 @@
+---
+title: "04 — Final Model Evaluation"
+format: html
+execute:
+  message: false
+  warning: false
+---
+
+```{r setup, include=FALSE}
+root_dir <- if (file.exists("data/raw")) "." else ".."
+knitr::opts_knit$set(root.dir = normalizePath(root_dir))
+knitr::opts_chunk$set(echo = TRUE, message = FALSE, warning = FALSE)
+```
+
+
+
+## Load trained models and preprocessing pipeline
+
+```{r load-models}
+library(tidyverse)
+library(caret)
+library(yardstick)
+library(pROC)
+library(xgboost)
+
+models_path <- "data/processed/models.rds"
+if (!file.exists(models_path)) {
+  stop("Model output not found. Run R/03_modeling.qmd first.")
+}
+
+saved <- readRDS(models_path)
+
+fit_logistic <- saved$models$logistic
+fit_lasso    <- saved$models$lasso
+fit_rf       <- saved$models$random_forest
+fit_xgb      <- saved$models$xgboost
+val_metrics_all <- saved$val_metrics
+best_model_name <- saved$best_model
+prep  <- saved$prep
+train_ref <- saved$train_ref
+
+cat("Best model from validation:", best_model_name, "\n")
+```
+
+
+
+## Prepare held-out test features
+
+```{r prepare-test}
+splits_path <- "data/processed/splits_caret.rds"
+if (!file.exists(splits_path)) {
+  stop("Splits not found. Run R/02_preprocess.qmd first.")
+}
+splits <- readRDS(splits_path)
+
+prepare_features <- function(train_reference, new_data, p) {
+  imputed    <- p$impute_from_train(train_reference, new_data)
+  predictors <- imputed |> select(all_of(p$keep_predictors))
+  features   <- as.data.frame(predict(p$dummy_vars, predictors))
+  features   <- features[, p$post_dummy_cols, drop = FALSE]
+  processed  <- as.data.frame(predict(p$pre_process, features))
+  list(x = processed, y = imputed$readmit_30)
+}
+
+test_prep <- prepare_features(train_ref, splits$test, prep)
+
+cat("Test observations:", nrow(test_prep$x), "\n")
+cat("Features:", ncol(test_prep$x), "\n")
+cat("Test readmission rate:",
+    scales::percent(mean(test_prep$y == "Yes"), accuracy = 0.1), "\n")
+```
+
+
+
+## Test-set predictions for all models
+
+```{r test-predictions}
+y_test_fac <- factor(test_prep$y, levels = c("No", "Yes"))
+x_test_mat <- as.matrix(test_prep$x)
+
+prob_logistic <- predict(fit_logistic, test_prep$x, type = "prob")[, "Yes"]
+prob_lasso    <- predict(fit_lasso,    test_prep$x, type = "prob")[, "Yes"]
+prob_rf       <- predict(fit_rf,       test_prep$x, type = "prob")[, "Yes"]
+prob_xgb      <- predict(fit_xgb, xgb.DMatrix(x_test_mat))
+
+class_logistic <- predict(fit_logistic, test_prep$x)
+class_lasso    <- predict(fit_lasso,    test_prep$x)
+class_rf       <- predict(fit_rf,       test_prep$x)
+class_xgb      <- factor(ifelse(prob_xgb >= 0.5, "Yes", "No"), levels = c("No", "Yes"))
+```
+
+
+
+## ROC curves on test set
+
+```{r roc-curves-test}
+roc_logistic <- roc(y_test_fac, prob_logistic, quiet = TRUE)
+roc_lasso    <- roc(y_test_fac, prob_lasso,    quiet = TRUE)
+roc_rf       <- roc(y_test_fac, prob_rf,       quiet = TRUE)
+roc_xgb      <- roc(y_test_fac, prob_xgb,      quiet = TRUE)
+
+roc_df <- bind_rows(
+  tibble(fpr = 1 - roc_logistic$specificities, tpr = roc_logistic$sensitivities,
+         model = sprintf("Logistic (AUC=%.3f)", auc(roc_logistic))),
+  tibble(fpr = 1 - roc_lasso$specificities,    tpr = roc_lasso$sensitivities,
+         model = sprintf("LASSO (AUC=%.3f)",    auc(roc_lasso))),
+  tibble(fpr = 1 - roc_rf$specificities,        tpr = roc_rf$sensitivities,
+         model = sprintf("Random Forest (AUC=%.3f)", auc(roc_rf))),
+  tibble(fpr = 1 - roc_xgb$specificities,       tpr = roc_xgb$sensitivities,
+         model = sprintf("XGBoost (AUC=%.3f)",  auc(roc_xgb)))
+)
+
+p_roc_test <- ggplot(roc_df, aes(x = fpr, y = tpr, color = model)) +
+  geom_line(linewidth = 0.9) +
+  geom_abline(slope = 1, intercept = 0, linetype = "dashed", color = "gray60") +
+  scale_color_brewer(palette = "Set1") +
+  labs(
+    title = "ROC Curves — Held-Out Test Set",
+    x = "False Positive Rate (1 − Specificity)",
+    y = "True Positive Rate (Sensitivity)",
+    color = NULL
+  ) +
+  theme_minimal() +
+  theme(legend.position = "bottom")
+
+print(p_roc_test)
+
+ggsave("output/figures/15_roc_curves_test.png", p_roc_test, width = 7, height = 6, dpi = 150)
+```
+
+
+
+## Test-set performance metrics
+
+```{r test-metrics}
+compute_metrics <- function(y_true, probs, preds, model_name) {
+  tibble(
+    model     = model_name,
+    roc_auc   = yardstick::roc_auc_vec(y_true, probs, event_level = "second"),
+    sens      = yardstick::sensitivity_vec(y_true, preds, event_level = "second"),
+    spec      = yardstick::specificity_vec(y_true, preds, event_level = "second"),
+    precision = yardstick::precision_vec(y_true, preds, event_level = "second"),
+    f1        = yardstick::f_meas_vec(y_true, preds, event_level = "second")
+  ) |>
+    mutate(across(where(is.numeric), \(x) round(x, 4)))
+}
+
+test_metrics_all <- bind_rows(
+  compute_metrics(y_test_fac, prob_logistic, class_logistic, "Logistic regression"),
+  compute_metrics(y_test_fac, prob_lasso,    class_lasso,    "LASSO"),
+  compute_metrics(y_test_fac, prob_rf,       class_rf,       "Random forest"),
+  compute_metrics(y_test_fac, prob_xgb,      class_xgb,      "XGBoost")
+) |>
+  arrange(desc(roc_auc))
+
+test_metrics_all
+```
+
+
+
+## Validation vs. test performance comparison
+
+```{r val-vs-test}
+val_long <- val_metrics_all |>
+  select(model, roc_auc, sens, spec) |>
+  mutate(split = "Validation")
+
+test_long <- test_metrics_all |>
+  select(model, roc_auc, sens, spec) |>
+  mutate(split = "Test")
+
+comparison <- bind_rows(val_long, test_long) |>
+  pivot_longer(c(roc_auc, sens, spec), names_to = "metric", values_to = "value") |>
+  mutate(
+    metric = recode(metric,
+      roc_auc = "ROC-AUC",
+      sens    = "Sensitivity",
+      spec    = "Specificity"
+    )
+  )
+
+p_comparison <- ggplot(comparison, aes(x = model, y = value, fill = split)) +
+  geom_col(position = "dodge") +
+  facet_wrap(~ metric, ncol = 1, scales = "free_y") +
+  scale_fill_manual(values = c("Validation" = "#4C78A8", "Test" = "#E45756")) +
+  scale_y_continuous(labels = scales::percent_format(accuracy = 1)) +
+  labs(
+    title = "Validation vs. Test Performance by Model",
+    x = NULL, y = NULL, fill = NULL
+  ) +
+  theme_minimal() +
+  theme(
+    axis.text.x = element_text(angle = 20, hjust = 1),
+    legend.position = "top"
+  )
+
+print(p_comparison)
+
+ggsave("output/figures/16_val_vs_test_comparison.png", p_comparison,
+       width = 8, height = 9, dpi = 150)
+```
+
+
+
+## Confusion matrices
+
+```{r confusion-matrices}
+cm_logistic <- confusionMatrix(class_logistic, y_test_fac, positive = "Yes")
+cm_lasso    <- confusionMatrix(class_lasso,    y_test_fac, positive = "Yes")
+cm_rf       <- confusionMatrix(class_rf,       y_test_fac, positive = "Yes")
+cm_xgb      <- confusionMatrix(class_xgb,      y_test_fac, positive = "Yes")
+
+format_cm <- function(cm, model_name) {
+  tbl <- as.data.frame(cm$table) |>
+    rename(Predicted = Prediction, Actual = Reference)
+
+  p <- ggplot(tbl, aes(x = Actual, y = Predicted, fill = Freq)) +
+    geom_tile(color = "white") +
+    geom_text(aes(label = Freq), size = 5) +
+    scale_fill_gradient(low = "white", high = "#4C78A8") +
+    labs(title = paste("Confusion Matrix —", model_name), fill = "Count") +
+    theme_minimal() +
+    theme(legend.position = "none")
+
+  p
+}
+
+p_cm_logistic <- format_cm(cm_logistic, "Logistic Regression")
+p_cm_lasso    <- format_cm(cm_lasso,    "LASSO")
+p_cm_rf       <- format_cm(cm_rf,       "Random Forest")
+p_cm_xgb      <- format_cm(cm_xgb,      "XGBoost")
+
+library(patchwork)
+
+p_cms <- (p_cm_logistic | p_cm_lasso) / (p_cm_rf | p_cm_xgb)
+print(p_cms)
+
+ggsave("output/figures/17_confusion_matrices.png", p_cms, width = 9, height = 8, dpi = 150)
+```
+
+
+
+## Precision-Recall curves
+
+```{r pr-curves}
+pr_curve_df <- function(y_true, probs, model_name) {
+  thresholds <- seq(0, 1, by = 0.01)
+  map_dfr(thresholds, function(t) {
+    preds <- factor(ifelse(probs >= t, "Yes", "No"), levels = c("No", "Yes"))
+    tibble(
+      threshold = t,
+      precision = yardstick::precision_vec(y_true, preds, event_level = "second"),
+      recall    = yardstick::sensitivity_vec(y_true, preds, event_level = "second"),
+      model     = model_name
+    )
+  }) |>
+    filter(!is.nan(precision))
+}
+
+pr_df <- bind_rows(
+  pr_curve_df(y_test_fac, prob_logistic, "Logistic regression"),
+  pr_curve_df(y_test_fac, prob_lasso,    "LASSO"),
+  pr_curve_df(y_test_fac, prob_rf,       "Random forest"),
+  pr_curve_df(y_test_fac, prob_xgb,      "XGBoost")
+)
+
+baseline_pr <- mean(y_test_fac == "Yes")
+
+p_pr <- ggplot(pr_df, aes(x = recall, y = precision, color = model)) +
+  geom_line(linewidth = 0.9) +
+  geom_hline(yintercept = baseline_pr, linetype = "dashed", color = "gray60") +
+  scale_color_brewer(palette = "Set1") +
+  labs(
+    title = "Precision-Recall Curves — Test Set",
+    subtitle = sprintf("Dashed line = baseline precision (%.1f%%)", baseline_pr * 100),
+    x = "Recall (Sensitivity)",
+    y = "Precision",
+    color = NULL
+  ) +
+  theme_minimal() +
+  theme(legend.position = "bottom")
+
+print(p_pr)
+
+ggsave("output/figures/18_precision_recall_test.png", p_pr, width = 7, height = 6, dpi = 150)
+```
+
+
+
+## Feature importance for best model
+
+```{r feature-importance-test}
+best_model_obj <- switch(best_model_name,
+  "Logistic regression" = fit_logistic,
+  "LASSO"              = fit_lasso,
+  "Random forest"      = fit_rf,
+  NULL
+)
+
+if (!is.null(best_model_obj)) {
+  imp <- varImp(best_model_obj, scale = TRUE)$importance |>
+    rownames_to_column("feature") |>
+    rename(importance = Overall) |>
+    arrange(desc(importance)) |>
+    slice_head(n = 20)
+
+  p_imp <- ggplot(imp, aes(x = importance, y = reorder(feature, importance))) +
+    geom_col(fill = "#4C78A8") +
+    labs(
+      title = paste("Top 20 Feature Importances —", best_model_name),
+      x = "Scaled importance", y = NULL
+    ) +
+    theme_minimal()
+
+  print(p_imp)
+  ggsave("output/figures/19_feature_importance_best.png", p_imp, width = 8, height = 7, dpi = 150)
+} else {
+  xgb_imp <- xgb.importance(model = fit_xgb) |>
+    as_tibble() |>
+    slice_head(n = 20)
+
+  p_imp <- ggplot(xgb_imp, aes(x = Gain, y = reorder(Feature, Gain))) +
+    geom_col(fill = "#4C78A8") +
+    labs(
+      title = "Top 20 Feature Importances — XGBoost (Best Model)",
+      x = "Gain", y = NULL
+    ) +
+    theme_minimal()
+
+  print(p_imp)
+  ggsave("output/figures/19_feature_importance_best.png", p_imp, width = 8, height = 7, dpi = 150)
+}
+```
+
+
+
+## Final model selection
+
+```{r final-selection}
+final_model_row <- test_metrics_all |> slice(1)
+
+cat("=== Final Selected Model ===\n")
+cat("Model:       ", final_model_row$model, "\n")
+cat("Test ROC-AUC:", final_model_row$roc_auc, "\n")
+cat("Sensitivity: ", final_model_row$sens, "\n")
+cat("Specificity: ", final_model_row$spec, "\n")
+cat("Precision:   ", final_model_row$precision, "\n")
+cat("F1 Score:    ", final_model_row$f1, "\n")
+
+cat("\nAll models — test set:\n")
+test_metrics_all
+```
+
+
+
+## Save evaluation results
+
+```{r save-evaluation}
+dir.create("data/processed", recursive = TRUE, showWarnings = FALSE)
+
+saveRDS(
+  list(
+    test_metrics  = test_metrics_all,
+    final_model   = final_model_row$model,
+    val_metrics   = val_metrics_all,
+    confusion_matrices = list(
+      logistic = cm_logistic,
+      lasso    = cm_lasso,
+      rf       = cm_rf,
+      xgb      = cm_xgb
+    )
+  ),
+  "data/processed/evaluation.rds"
+)
+
+cat("Evaluation results saved to data/processed/evaluation.rds\n")
+```
