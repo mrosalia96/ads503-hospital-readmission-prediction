@@ -1,0 +1,88 @@
+---
+title: "02 — Data Preprocessing"
+format: html
+execute:
+  message: false
+  warning: false
+---
+
+```{r setup, include=FALSE}
+root_dir <- if (file.exists("data/raw")) "." else ".."
+knitr::opts_knit$set(root.dir = normalizePath(root_dir))
+knitr::opts_chunk$set(echo = TRUE, message = FALSE, warning = FALSE)
+```
+
+
+
+## Load cleaned EDA data
+
+```{r load-eda}
+library(tidyverse)
+library(caret)
+
+eda_path <- "data/processed/eda_data.rds"
+if (!file.exists(eda_path)) {
+  stop("EDA data not found. Run R/01_eda.qmd first.")
+}
+
+eda_data <- readRDS(eda_path)
+```
+
+
+
+## Drop IDs, low-information predictors, and death/hospice rows
+
+```{r feature-selection}
+death_hospice_ids <- c(11, 13, 14, 19, 20, 21)
+
+drop_cols <- c(
+  "encounter_id",
+  "patient_nbr",
+  "readmitted",
+  "weight",
+  "max_glu_serum",
+  "A1Cresult"
+)
+
+model_data <- eda_data |>
+  filter(!discharge_disposition_id %in% death_hospice_ids) |>
+  select(-any_of(drop_cols)) |>
+  mutate(
+    readmit_30 = factor(readmit_30, levels = c("No", "Yes")),
+    across(where(is.character), as.factor)
+  ) |>
+  distinct()
+
+cat("Excluded death/hospice rows:", sum(eda_data$discharge_disposition_id %in% death_hospice_ids), "\n")
+cat("Modeling rows:", nrow(model_data), "\n")
+cat("Predictors:", ncol(model_data) - 1, "\n")
+```
+
+
+
+## Stratified train validation test split
+
+```{r split}
+set.seed(503)
+
+train_val_idx <- createDataPartition(model_data$readmit_30, p = 0.75, list = FALSE)
+train_val <- model_data[train_val_idx, ]
+test_data <- model_data[-train_val_idx, ]
+
+train_idx <- createDataPartition(train_val$readmit_30, p = 0.8, list = FALSE)
+train_data <- train_val[train_idx, ]
+val_data <- train_val[-train_idx, ]
+
+split_summary <- tibble(
+  split = c("Train", "Validation", "Test"),
+  n = c(nrow(train_data), nrow(val_data), nrow(test_data)),
+  readmit_rate = c(
+    mean(train_data$readmit_30 == "Yes"),
+    mean(val_data$readmit_30 == "Yes"),
+    mean(test_data$readmit_30 == "Yes")
+  )
+) |>
+  mutate(readmit_rate = scales::percent(readmit_rate, accuracy = 0.1))
+
+split_summary
+```
