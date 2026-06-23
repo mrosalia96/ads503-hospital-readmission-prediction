@@ -11,7 +11,8 @@ root_dir <- if (file.exists("data/raw")) "." else ".."
 knitr::opts_knit$set(root.dir = normalizePath(root_dir))
 ```
 
-## Load data
+
+## Load raw hospital dataset
 
 ```{r load-data}
 library(tidyverse)
@@ -28,9 +29,31 @@ if (!file.exists(csv_path)) {
 raw <- read_csv(csv_path, show_col_types = FALSE)
 raw <- raw |>
   mutate(across(where(is.character), ~ na_if(.x, "?")))
+
+mapping_path <- "data/raw/IDS_mapping.csv"
+if (!file.exists(mapping_path)) {
+  stop("ID mapping file not found. Re-run source('scripts/download_data.R').")
+}
+
+load_id_mapping <- function(section) {
+  lines <- readLines(mapping_path)
+  header_idx <- which(lines == paste0(section, ",description"))[1]
+  comma_idxs <- which(lines == ",")
+  stop_idx <- comma_idxs[comma_idxs > header_idx][1]
+  body <- lines[(header_idx + 1):(stop_idx - 1)]
+  df <- read_csv(
+    I(c(paste0(section, ",description"), body)),
+    show_col_types = FALSE
+  )
+  setNames(df$description, as.character(df[[section]]))
+}
+
+admission_type_labels <- load_id_mapping("admission_type_id")
+discharge_disposition_labels <- load_id_mapping("discharge_disposition_id")
 ```
 
-## Define the target variable
+
+## Define 30-day readmission target
 
 ```{r target-variable}
 age_levels <- c(
@@ -55,7 +78,8 @@ cat("30-day readmission rate:",
     scales::percent(mean(eda_data$readmit_30 == "Yes"), accuracy = 0.1), "\n")
 ```
 
-## Class imbalance
+
+## Explore class imbalance in readmission
 
 ```{r class-imbalance}
 class_counts <- eda_data |>
@@ -74,7 +98,42 @@ p_imbalance <- ggplot(class_counts, aes(x = readmit_30, y = pct, fill = readmit_
 print(p_imbalance)
 ```
 
-## Summary statistics
+
+## Readmission by age and utilization
+
+```{r age-utilization}
+#| fig-width: 8
+#| fig-height: 5
+#| fig-show: hold
+
+p_age <- ggplot(eda_data, aes(x = age, fill = readmit_30)) +
+  geom_bar(position = "fill") +
+  scale_fill_manual(values = fill_colors) +
+  labs(title = "Readmission Rate by Age Group", x = "Age group", y = "Proportion") +
+  theme_minimal() +
+  theme(legend.title = element_blank())
+
+p_los <- ggplot(eda_data, aes(x = time_in_hospital, fill = readmit_30)) +
+  geom_histogram(binwidth = 1, position = "fill", color = "white") +
+  scale_fill_manual(values = fill_colors) +
+  labs(title = "Readmission Rate by Length of Stay", x = "Days in hospital", y = "Proportion") +
+  theme_minimal() +
+  theme(legend.title = element_blank())
+
+p_meds <- ggplot(eda_data, aes(x = num_medications, fill = readmit_30)) +
+  geom_histogram(binwidth = 1, position = "fill", color = "white") +
+  scale_fill_manual(values = fill_colors) +
+  labs(title = "Readmission Rate by Number of Medications", x = "Number of medications", y = "Proportion") +
+  theme_minimal() +
+  theme(legend.title = element_blank())
+
+print(p_age)
+print(p_los)
+print(p_meds)
+```
+
+
+## Summary statistics for numeric predictors
 
 ```{r summary-stats}
 eda_data |>
@@ -82,7 +141,8 @@ eda_data |>
   summary()
 ```
 
-## Missing values
+
+## Missing values by variable
 
 ```{r missing-values}
 missing_pct <- eda_data |>
@@ -94,7 +154,8 @@ missing_pct <- eda_data |>
 missing_pct
 ```
 
-## Variables to exclude
+
+## Identify low-information variables to exclude
 
 ```{r variables-to-exclude}
 low_info <- tibble(
@@ -111,7 +172,8 @@ low_info <- tibble(
 low_info
 ```
 
-## Categorical distributions
+
+## Categorical predictor distributions
 
 ```{r categorical}
 cat("Raw readmission status:\n")
@@ -121,10 +183,20 @@ cat("\nAge group counts:\n")
 print(table(eda_data$age))
 ```
 
+
 ## Readmission by clinical factors
 
 ```{r clinical-factors}
-plot_readmit_rate <- function(data, x_var, title, flip = FALSE) {
+#| fig-width: 8
+#| fig-height: 6
+#| fig-show: hold
+
+label_id <- function(x, labels) {
+  mapped <- labels[as.character(x)]
+  ifelse(is.na(mapped), paste("ID", x), mapped)
+}
+
+plot_readmit_rate <- function(data, x_var, title, horizontal = FALSE) {
   data <- data |>
     mutate(
       !!sym(x_var) := fct_reorder(
@@ -134,35 +206,51 @@ plot_readmit_rate <- function(data, x_var, title, flip = FALSE) {
       )
     )
 
-  if (flip) {
+  if (horizontal) {
     ggplot(data, aes(y = .data[[x_var]], fill = readmit_30)) +
       geom_bar(position = "fill") +
       scale_fill_manual(values = fill_colors) +
+      scale_y_discrete(labels = function(x) stringr::str_wrap(x, 40)) +
       labs(title = title, x = "Proportion", y = NULL) +
-      coord_flip() +
+      coord_cartesian(clip = "off") +
       theme_minimal() +
-      theme(legend.title = element_blank())
+      theme(
+        legend.title = element_blank(),
+        axis.text.y = element_text(size = 8),
+        plot.margin = margin(10, 10, 10, 10)
+      )
   } else {
     ggplot(data, aes(x = .data[[x_var]], fill = readmit_30)) +
       geom_bar(position = "fill") +
       scale_fill_manual(values = fill_colors) +
       labs(title = title, x = NULL, y = "Proportion") +
+      coord_cartesian(clip = "off") +
       theme_minimal() +
-      theme(legend.title = element_blank(), axis.text.x = element_text(angle = 45, hjust = 1))
+      theme(
+        legend.title = element_blank(),
+        plot.margin = margin(10, 10, 10, 10)
+      )
   }
 }
 
+eda_labeled <- eda_data |>
+  mutate(
+    admission_type = label_id(admission_type_id, admission_type_labels),
+    discharge_disposition = label_id(discharge_disposition_id, discharge_disposition_labels)
+  )
+
 p_admission <- plot_readmit_rate(
-  eda_data |> mutate(admission_type_id = factor(admission_type_id)),
-  "admission_type_id",
-  "Readmission Rate by Admission Type"
+  eda_labeled,
+  "admission_type",
+  "Readmission Rate by Admission Type",
+  horizontal = TRUE
 )
 
 p_discharge <- plot_readmit_rate(
-  eda_data |> mutate(discharge_disposition_id = factor(discharge_disposition_id)),
-  "discharge_disposition_id",
+  eda_labeled,
+  "discharge_disposition",
   "Readmission Rate by Discharge Disposition",
-  flip = TRUE
+  horizontal = TRUE
 )
 
 p_diabetes_med <- plot_readmit_rate(eda_data, "diabetesMed", "Readmission Rate by Diabetes Medication")
@@ -170,12 +258,38 @@ p_diabetes_med <- plot_readmit_rate(eda_data, "diabetesMed", "Readmission Rate b
 p_change <- plot_readmit_rate(eda_data, "change", "Readmission Rate by Medication Change")
 
 print(p_admission)
-print(p_discharge)
 print(p_diabetes_med)
 print(p_change)
 ```
 
-## Numeric distributions
+```{r discharge-disposition}
+#| fig-width: 8
+#| fig-height: 12
+
+print(p_discharge)
+```
+
+
+## Death and hospice discharge dispositions
+
+```{r death-hospice}
+death_hospice_ids <- c(11, 13, 14, 19, 20, 21)
+
+death_hospice <- eda_data |>
+  filter(discharge_disposition_id %in% death_hospice_ids) |>
+  mutate(
+    disposition = discharge_disposition_labels[as.character(discharge_disposition_id)]
+  ) |>
+  count(disposition, readmit_30) |>
+  pivot_wider(names_from = readmit_30, values_from = n, values_fill = 0) |>
+  mutate(encounters = No + Yes, pct_of_data = scales::percent(encounters / nrow(eda_data), accuracy = 0.1)) |>
+  select(disposition, encounters, pct_of_data, No, Yes)
+
+death_hospice
+```
+
+
+## Numeric predictor distributions by readmission
 
 ```{r boxplots}
 p_box_los <- ggplot(eda_data, aes(x = readmit_30, y = time_in_hospital, fill = readmit_30)) +
@@ -193,6 +307,7 @@ p_box_meds <- ggplot(eda_data, aes(x = readmit_30, y = num_medications, fill = r
 print(p_box_los)
 print(p_box_meds)
 ```
+
 
 ## Correlation among predictors
 
@@ -243,60 +358,25 @@ p_cor <- ggplot(cor_long, aes(x = var1, y = var2, fill = correlation)) +
 print(p_cor)
 ```
 
-## Visual exploration
 
-```{r plots}
-p1 <- ggplot(eda_data, aes(x = readmit_30, fill = readmit_30)) +
-  geom_bar(show.legend = FALSE) +
-  scale_fill_manual(values = fill_colors) +
-  labs(title = "30-Day Readmission Counts", x = "Readmitted within 30 days", y = "Count") +
-  theme_minimal()
-
-p2 <- ggplot(eda_data, aes(x = age, fill = readmit_30)) +
-  geom_bar(position = "fill") +
-  scale_fill_manual(values = fill_colors) +
-  labs(title = "Readmission Rate by Age Group", x = "Age group", y = "Proportion") +
-  theme_minimal() +
-  theme(legend.title = element_blank())
-
-p3 <- ggplot(eda_data, aes(x = time_in_hospital, fill = readmit_30)) +
-  geom_histogram(binwidth = 1, position = "fill", color = "white") +
-  scale_fill_manual(values = fill_colors) +
-  labs(title = "Readmission Rate by Length of Stay", x = "Days in hospital", y = "Proportion") +
-  theme_minimal() +
-  theme(legend.title = element_blank())
-
-p4 <- ggplot(eda_data, aes(x = num_medications, fill = readmit_30)) +
-  geom_histogram(binwidth = 1, position = "fill", color = "white") +
-  scale_fill_manual(values = fill_colors) +
-  labs(title = "Readmission Rate by Number of Medications", x = "Number of medications", y = "Proportion") +
-  theme_minimal() +
-  theme(legend.title = element_blank())
-
-print(p1)
-print(p2)
-print(p3)
-print(p4)
-```
-
-## Save figures
+## Save EDA figures to output
 
 ```{r save-plots}
-ggsave(file.path(fig_dir, "01_readmission_distribution.png"), p1, width = 7, height = 5, dpi = 150)
-ggsave(file.path(fig_dir, "02_readmission_by_age.png"), p2, width = 8, height = 5, dpi = 150)
-ggsave(file.path(fig_dir, "03_readmission_by_los.png"), p3, width = 8, height = 5, dpi = 150)
-ggsave(file.path(fig_dir, "04_readmission_by_medications.png"), p4, width = 8, height = 5, dpi = 150)
-ggsave(file.path(fig_dir, "05_class_imbalance.png"), p_imbalance, width = 7, height = 5, dpi = 150)
-ggsave(file.path(fig_dir, "06_readmission_by_admission_type.png"), p_admission, width = 8, height = 5, dpi = 150)
-ggsave(file.path(fig_dir, "07_readmission_by_discharge.png"), p_discharge, width = 8, height = 10, dpi = 150)
-ggsave(file.path(fig_dir, "08_readmission_by_diabetes_med.png"), p_diabetes_med, width = 7, height = 5, dpi = 150)
-ggsave(file.path(fig_dir, "09_readmission_by_change.png"), p_change, width = 7, height = 5, dpi = 150)
-ggsave(file.path(fig_dir, "10_boxplot_los.png"), p_box_los, width = 7, height = 5, dpi = 150)
-ggsave(file.path(fig_dir, "11_boxplot_medications.png"), p_box_meds, width = 7, height = 5, dpi = 150)
-ggsave(file.path(fig_dir, "12_correlation_heatmap.png"), p_cor, width = 9, height = 7, dpi = 150)
+ggsave(file.path(fig_dir, "01_class_imbalance.png"), p_imbalance, width = 7, height = 5, dpi = 150)
+ggsave(file.path(fig_dir, "02_readmission_by_age.png"), p_age, width = 8, height = 5, dpi = 150)
+ggsave(file.path(fig_dir, "03_readmission_by_los.png"), p_los, width = 8, height = 5, dpi = 150)
+ggsave(file.path(fig_dir, "04_readmission_by_medications.png"), p_meds, width = 8, height = 5, dpi = 150)
+ggsave(file.path(fig_dir, "05_readmission_by_admission_type.png"), p_admission, width = 8, height = 6, dpi = 150)
+ggsave(file.path(fig_dir, "06_readmission_by_discharge.png"), p_discharge, width = 8, height = 12, dpi = 150)
+ggsave(file.path(fig_dir, "07_readmission_by_diabetes_med.png"), p_diabetes_med, width = 7, height = 5, dpi = 150)
+ggsave(file.path(fig_dir, "08_readmission_by_change.png"), p_change, width = 7, height = 5, dpi = 150)
+ggsave(file.path(fig_dir, "09_boxplot_los.png"), p_box_los, width = 7, height = 5, dpi = 150)
+ggsave(file.path(fig_dir, "10_boxplot_medications.png"), p_box_meds, width = 7, height = 5, dpi = 150)
+ggsave(file.path(fig_dir, "11_correlation_heatmap.png"), p_cor, width = 9, height = 7, dpi = 150)
 ```
 
-## Save output
+
+## Save cleaned data for preprocessing
 
 ```{r save-data}
 dir.create("data/processed", recursive = TRUE, showWarnings = FALSE)
