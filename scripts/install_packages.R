@@ -12,6 +12,7 @@ required <- c(
   "yardstick",
   "themis",
   "scales",
+  "pROC",
   "patchwork",
   "knitr",
   "rmarkdown"

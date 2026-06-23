@@ -1,0 +1,424 @@
+---
+title: "03 — Model Training"
+format: html
+execute:
+  message: false
+  warning: false
+---
+
+```{r setup, include=FALSE}
+root_dir <- if (file.exists("data/raw")) "." else ".."
+knitr::opts_knit$set(root.dir = normalizePath(root_dir))
+knitr::opts_chunk$set(echo = TRUE, message = FALSE, warning = FALSE)
+```
+
+
+
+## Load preprocessed splits
+
+```{r load-data}
+library(tidyverse)
+library(caret)
+library(yardstick)
+
+splits_path <- "data/processed/splits_caret.rds"
+if (!file.exists(splits_path)) {
+  stop("Preprocessing output not found. Run R/02_preprocess.qmd first.")
+}
+
+prep_obj <- readRDS(splits_path)
+train_ref <- prep_obj$train
+```
+
+
+
+## Prepare feature matrices for train and validation
+
+```{r prepare-features}
+prepare_features <- function(train_reference, new_data, prep) {
+  imputed <- prep$impute_from_train(train_reference, new_data)
+  predictors <- imputed |> select(all_of(prep$keep_predictors))
+
+  features <- as.data.frame(predict(prep$dummy_vars, predictors))
+  features <- features[, prep$post_dummy_cols, drop = FALSE]
+  processed <- as.data.frame(predict(prep$pre_process, features))
+
+  list(x = processed, y = imputed$readmit_30)
+}
+
+val_metrics <- function(fit, x_val, y_val) {
+  if (!is.matrix(x_val)) {
+    x_val <- as.matrix(x_val)
+  }
+
+  val_probs <- predict(fit, x_val, type = "prob")[, "Yes"]
+  y_factor <- factor(y_val, levels = c("No", "Yes"))
+
+  tibble(
+    roc_auc = yardstick::roc_auc_vec(y_factor, val_probs, event_level = "second"),
+    sens = yardstick::sensitivity_vec(y_factor, predict(fit, x_val), event_level = "second"),
+    spec = yardstick::specificity_vec(y_factor, predict(fit, x_val), event_level = "second")
+  ) |>
+    mutate(across(where(is.numeric), as.numeric))
+}
+
+ctrl_none <- trainControl(method = "none", classProbs = TRUE, savePredictions = "final")
+
+tune_on_validation <- function(train_data, x_val, y_val, method, grid, ...) {
+  best_auc <- -Inf
+  best_fit <- NULL
+  results <- vector("list", nrow(grid))
+
+  for (i in seq_len(nrow(grid))) {
+    fit_i <- train(
+      readmit_30 ~ .,
+      data = train_data,
+      method = method,
+      trControl = ctrl_none,
+      tuneGrid = grid[i, , drop = FALSE],
+      ...
+    )
+
+    metrics_i <- val_metrics(fit_i, x_val, y_val)
+    results[[i]] <- bind_cols(grid[i, , drop = FALSE], metrics_i)
+
+    if (metrics_i$roc_auc > best_auc) {
+      best_auc <- metrics_i$roc_auc
+      best_fit <- fit_i
+    }
+  }
+
+  list(fit = best_fit, results = bind_rows(results))
+}
+
+train_prep <- prepare_features(train_ref, prep_obj$train, prep_obj)
+val_prep <- prepare_features(train_ref, prep_obj$validation, prep_obj)
+
+cat("Training features:", ncol(train_prep$x), "\n")
+cat("Validation features:", ncol(val_prep$x), "\n")
+```
+
+
+
+## Downsample training data for class imbalance
+
+```{r downsample}
+set.seed(503)
+
+train_balanced <- downSample(
+  x = train_prep$x,
+  y = train_prep$y,
+  yname = "readmit_30"
+)
+
+train_balanced |>
+  count(readmit_30) |>
+  mutate(pct = scales::percent(n / sum(n), accuracy = 0.1))
+```
+
+
+
+## Logistic regression
+
+```{r logistic}
+fit_logistic <- train(
+  readmit_30 ~ .,
+  data = train_balanced,
+  method = "glm",
+  family = binomial(),
+  trControl = ctrl_none
+)
+
+logistic_val <- val_metrics(fit_logistic, val_prep$x, val_prep$y) |>
+  mutate(model = "Logistic regression")
+
+logistic_val
+```
+
+
+
+## LASSO with validation tuning
+
+```{r lasso}
+lasso_grid <- expand.grid(
+  alpha = c(0, 0.5, 1),
+  lambda = seq(0.001, 0.05, length.out = 5)
+)
+
+lasso_tuned <- tune_on_validation(
+  train_data = train_balanced,
+  x_val = val_prep$x,
+  y_val = val_prep$y,
+  method = "glmnet",
+  grid = lasso_grid,
+  family = "binomial"
+)
+
+fit_lasso <- lasso_tuned$fit
+lasso_val <- val_metrics(fit_lasso, val_prep$x, val_prep$y) |>
+  mutate(model = "LASSO")
+
+lasso_val
+```
+
+
+
+## Random forest with validation tuning
+
+```{r random-forest}
+rf_grid <- expand.grid(
+  mtry = c(100, 200),
+  splitrule = "gini",
+  min.node.size = 5
+)
+
+rf_tuned <- tune_on_validation(
+  train_data = train_balanced,
+  x_val = val_prep$x,
+  y_val = val_prep$y,
+  method = "ranger",
+  grid = rf_grid,
+  importance = "none",
+  num.trees = 75,
+  num.threads = parallel::detectCores()
+)
+
+fit_rf <- rf_tuned$fit
+rf_val <- val_metrics(fit_rf, val_prep$x, val_prep$y) |>
+  mutate(model = "Random forest")
+
+rf_val
+```
+
+
+
+## XGBoost with validation tuning
+
+```{r xgboost}
+library(xgboost)
+
+x_train <- train_balanced |> select(-readmit_30) |> as.matrix()
+y_train <- ifelse(train_balanced$readmit_30 == "Yes", 1, 0)
+x_val_mat <- as.matrix(val_prep$x)
+dtrain <- xgb.DMatrix(data = x_train, label = y_train)
+dval <- xgb.DMatrix(data = x_val_mat)
+
+xgb_grid <- expand.grid(
+  nrounds = c(50, 100),
+  max_depth = c(3, 5),
+  eta = 0.1,
+  gamma = 0,
+  colsample_bytree = 0.8,
+  min_child_weight = 1,
+  subsample = 0.8
+)
+
+xgb_metrics <- function(booster, x_val, y_val) {
+  probs <- predict(booster, xgb.DMatrix(as.matrix(x_val)))
+  y_factor <- factor(y_val, levels = c("No", "Yes"))
+  pred_class <- factor(ifelse(probs >= 0.5, "Yes", "No"), levels = c("No", "Yes"))
+
+  tibble(
+    roc_auc = yardstick::roc_auc_vec(y_factor, probs, event_level = "second"),
+    sens = yardstick::sensitivity_vec(y_factor, pred_class, event_level = "second"),
+    spec = yardstick::specificity_vec(y_factor, pred_class, event_level = "second")
+  ) |>
+    mutate(across(where(is.numeric), as.numeric))
+}
+
+xgb_results <- vector("list", nrow(xgb_grid))
+best_xgb_auc <- -Inf
+fit_xgb <- NULL
+
+for (i in seq_len(nrow(xgb_grid))) {
+  params_i <- list(
+    objective = "binary:logistic",
+    eval_metric = "auc",
+    max_depth = xgb_grid$max_depth[i],
+    eta = xgb_grid$eta[i],
+    gamma = xgb_grid$gamma[i],
+    colsample_bytree = xgb_grid$colsample_bytree[i],
+    min_child_weight = xgb_grid$min_child_weight[i],
+    subsample = xgb_grid$subsample[i]
+  )
+
+  fit_i <- xgb.train(
+    params = params_i,
+    data = dtrain,
+    nrounds = xgb_grid$nrounds[i],
+    verbose = 0
+  )
+
+  metrics_i <- xgb_metrics(fit_i, x_val_mat, val_prep$y)
+  xgb_results[[i]] <- bind_cols(xgb_grid[i, , drop = FALSE], metrics_i)
+
+  if (metrics_i$roc_auc > best_xgb_auc) {
+    best_xgb_auc <- metrics_i$roc_auc
+    fit_xgb <- fit_i
+  }
+}
+
+xgb_tuned <- list(fit = fit_xgb, results = bind_rows(xgb_results))
+
+xgb_val <- xgb_metrics(fit_xgb, x_val_mat, val_prep$y) |>
+  mutate(model = "XGBoost")
+
+xgb_val
+```
+
+
+
+## Compare validation performance
+
+```{r model-comparison}
+val_metrics_all <- bind_rows(logistic_val, lasso_val, rf_val, xgb_val) |>
+  select(model, roc_auc, sens, spec) |>
+  arrange(desc(roc_auc))
+
+val_metrics_all
+
+best_model_name <- val_metrics_all$model[1]
+cat("\nBest model on validation:", best_model_name, "\n")
+```
+
+
+
+## Hyperparameter tuning results
+
+```{r tuning-results}
+lasso_tuned$results |>
+  arrange(desc(roc_auc)) |>
+  mutate(across(where(is.numeric), \(x) round(x, 4))) |>
+  head(5)
+
+rf_tuned$results |>
+  arrange(desc(roc_auc)) |>
+  mutate(across(where(is.numeric), \(x) round(x, 4)))
+
+xgb_tuned$results |>
+  arrange(desc(roc_auc)) |>
+  select(nrounds, max_depth, roc_auc, sens, spec) |>
+  mutate(across(where(is.numeric), \(x) round(x, 4))) |>
+  head(5)
+```
+
+
+
+## ROC curves on validation set
+
+```{r roc-curves}
+library(pROC)
+
+y_val_fac <- factor(val_prep$y, levels = c("No", "Yes"))
+
+roc_logistic <- roc(y_val_fac, predict(fit_logistic, val_prep$x, type = "prob")[, "Yes"], quiet = TRUE)
+roc_lasso    <- roc(y_val_fac, predict(fit_lasso, val_prep$x, type = "prob")[, "Yes"], quiet = TRUE)
+roc_rf       <- roc(y_val_fac, predict(fit_rf, val_prep$x, type = "prob")[, "Yes"], quiet = TRUE)
+roc_xgb      <- roc(y_val_fac, predict(fit_xgb, xgb.DMatrix(as.matrix(val_prep$x))), quiet = TRUE)
+
+roc_df <- bind_rows(
+  tibble(fpr = 1 - roc_logistic$specificities, tpr = roc_logistic$sensitivities, model = sprintf("Logistic (AUC=%.3f)", auc(roc_logistic))),
+  tibble(fpr = 1 - roc_lasso$specificities,    tpr = roc_lasso$sensitivities,    model = sprintf("LASSO (AUC=%.3f)",    auc(roc_lasso))),
+  tibble(fpr = 1 - roc_rf$specificities,        tpr = roc_rf$sensitivities,        model = sprintf("Random Forest (AUC=%.3f)", auc(roc_rf))),
+  tibble(fpr = 1 - roc_xgb$specificities,       tpr = roc_xgb$sensitivities,       model = sprintf("XGBoost (AUC=%.3f)",  auc(roc_xgb)))
+)
+
+p_roc <- ggplot(roc_df, aes(x = fpr, y = tpr, color = model)) +
+  geom_line(linewidth = 0.9) +
+  geom_abline(slope = 1, intercept = 0, linetype = "dashed", color = "gray60") +
+  scale_color_brewer(palette = "Set1") +
+  labs(
+    title = "ROC Curves — Validation Set",
+    x = "False Positive Rate (1 − Specificity)",
+    y = "True Positive Rate (Sensitivity)",
+    color = NULL
+  ) +
+  theme_minimal() +
+  theme(legend.position = "bottom")
+
+print(p_roc)
+
+ggsave("output/figures/13_roc_curves_validation.png", p_roc, width = 7, height = 6, dpi = 150)
+```
+
+
+
+## Feature importance (best model)
+
+```{r feature-importance}
+best_model_obj <- switch(best_model_name,
+  "Logistic regression" = fit_logistic,
+  "LASSO"              = fit_lasso,
+  "Random forest"      = fit_rf,
+  NULL
+)
+
+if (!is.null(best_model_obj)) {
+  imp <- varImp(best_model_obj, scale = TRUE)$importance |>
+    rownames_to_column("feature") |>
+    rename(importance = Overall) |>
+    arrange(desc(importance)) |>
+    slice_head(n = 20)
+
+  p_imp <- ggplot(imp, aes(x = importance, y = reorder(feature, importance))) +
+    geom_col(fill = "#4C78A8") +
+    labs(
+      title = paste("Top 20 Feature Importances —", best_model_name),
+      x = "Scaled importance", y = NULL
+    ) +
+    theme_minimal()
+
+  print(p_imp)
+  ggsave("output/figures/14_feature_importance.png", p_imp, width = 8, height = 7, dpi = 150)
+} else {
+  xgb_imp <- xgb.importance(model = fit_xgb) |>
+    as_tibble() |>
+    slice_head(n = 20)
+
+  p_imp <- ggplot(xgb_imp, aes(x = Gain, y = reorder(Feature, Gain))) +
+    geom_col(fill = "#4C78A8") +
+    labs(
+      title = "Top 20 Feature Importances — XGBoost",
+      x = "Gain", y = NULL
+    ) +
+    theme_minimal()
+
+  print(p_imp)
+  ggsave("output/figures/14_feature_importance.png", p_imp, width = 8, height = 7, dpi = 150)
+}
+```
+
+
+
+## Save trained models
+
+```{r save}
+dir.create("data/processed", recursive = TRUE, showWarnings = FALSE)
+
+saveRDS(
+  list(
+    models = list(
+      logistic = fit_logistic,
+      lasso = fit_lasso,
+      random_forest = fit_rf,
+      xgboost = fit_xgb
+    ),
+    val_metrics = val_metrics_all,
+    best_model = best_model_name,
+    tuning = list(
+      lasso = lasso_tuned$results,
+      random_forest = rf_tuned$results,
+      xgboost = xgb_tuned$results
+    ),
+    prep = prep_obj[c(
+      "impute_from_train",
+      "keep_predictors",
+      "dummy_vars",
+      "post_dummy_cols",
+      "pre_process"
+    )],
+    train_ref = train_ref
+  ),
+  "data/processed/models.rds"
+)
+```

@@ -13,6 +13,7 @@ R/*_cache/
 R/*_files/
 *.knit.md
 *.utf8.md
+*.rmarkdown
 
 # R
 .Rhistory
