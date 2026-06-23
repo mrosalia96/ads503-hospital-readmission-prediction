@@ -28,7 +28,7 @@ if (!file.exists(csv_path)) {
 
 raw <- read_csv(csv_path, show_col_types = FALSE)
 raw <- raw |>
-  mutate(across(where(is.character), ~ na_if(.x, "?")))
+  mutate(across(where(is.character), ~ na_if(na_if(.x, "?"), "None")))
 
 mapping_path <- "data/raw/IDS_mapping.csv"
 if (!file.exists(mapping_path)) {
@@ -36,16 +36,22 @@ if (!file.exists(mapping_path)) {
 }
 
 load_id_mapping <- function(section) {
-  lines <- readLines(mapping_path)
-  header_idx <- which(lines == paste0(section, ",description"))[1]
-  comma_idxs <- which(lines == ",")
-  stop_idx <- comma_idxs[comma_idxs > header_idx][1]
-  body <- lines[(header_idx + 1):(stop_idx - 1)]
-  df <- read_csv(
-    I(c(paste0(section, ",description"), body)),
-    show_col_types = FALSE
-  )
-  setNames(df$description, as.character(df[[section]]))
+  df <- read_csv(mapping_path, col_names = c("id", "description"),
+                 show_col_types = FALSE)
+
+  is_blank  <- is.na(df$id) & is.na(df$description)
+  is_header <- !is.na(df$description) & df$description == "description"
+  group     <- cumsum(is_header)
+
+  data_rows <- df[!is_header & !is_blank, ]
+  groups    <- group[!is_header & !is_blank]
+  section_keys <- df$id[is_header]
+
+  idx <- match(section, section_keys)
+  if (is.na(idx)) stop(paste("Section not found in mapping file:", section))
+
+  body <- data_rows[groups == idx, ]
+  setNames(body$description, body$id)
 }
 
 admission_type_labels <- load_id_mapping("admission_type_id")
@@ -106,17 +112,27 @@ print(p_imbalance)
 #| fig-height: 5
 #| fig-show: hold
 
+age_counts <- eda_data |> count(age, name = "n_total")
+
 p_age <- ggplot(eda_data, aes(x = age, fill = readmit_30)) +
   geom_bar(position = "fill") +
+  geom_text(
+    data = age_counts,
+    aes(x = age, y = 1.02, label = scales::comma(n_total)),
+    inherit.aes = FALSE, size = 2.5, vjust = 0
+  ) +
+  scale_y_continuous(labels = scales::percent, expand = expansion(mult = c(0, 0.08))) +
   scale_fill_manual(values = fill_colors) +
-  labs(title = "Readmission Rate by Age Group", x = "Age group", y = "Proportion") +
+  labs(title = "Readmission Rate by Age Group", x = "Age group", y = "Proportion",
+       caption = "Numbers above bars = group sample size") +
   theme_minimal() +
   theme(legend.title = element_blank())
 
 p_los <- ggplot(eda_data, aes(x = time_in_hospital, fill = readmit_30)) +
   geom_histogram(binwidth = 1, position = "fill", color = "white") +
   scale_fill_manual(values = fill_colors) +
-  labs(title = "Readmission Rate by Length of Stay", x = "Days in hospital", y = "Proportion") +
+  labs(title = "Readmission Rate by Length of Stay", x = "Days in hospital", y = "Proportion",
+       caption = "Each bar represents one day; proportion of readmitted patients shown") +
   theme_minimal() +
   theme(legend.title = element_blank())
 
@@ -162,8 +178,8 @@ low_info <- tibble(
   variable = c("weight", "max_glu_serum", "A1Cresult"),
   pct_missing_or_unmeasured = c(
     mean(is.na(eda_data$weight)),
-    mean(eda_data$max_glu_serum == "None", na.rm = TRUE),
-    mean(eda_data$A1Cresult == "None", na.rm = TRUE)
+    mean(is.na(eda_data$max_glu_serum)),
+    mean(is.na(eda_data$A1Cresult))
   ),
   recommendation = "Exclude from modeling"
 ) |>
@@ -344,13 +360,25 @@ cor_long <- cor_mat |>
     var2 = factor(var2, levels = rev(label_order))
   )
 
+high_corr_pairs <- cor_long |>
+  filter(as.character(var1) != as.character(var2), abs(correlation) >= 0.9)
+
 p_cor <- ggplot(cor_long, aes(x = var1, y = var2, fill = correlation)) +
   geom_tile(color = "white") +
+  geom_text(
+    data = high_corr_pairs,
+    aes(label = sprintf("%.2f", correlation)),
+    size = 2.8, color = "white", fontface = "bold"
+  ) +
   scale_fill_gradient2(
     low = "#4C78A8", mid = "white", high = "#E45756",
     midpoint = 0, limits = c(-1, 1)
   ) +
-  labs(title = "Correlation Among Numeric Predictors", x = NULL, y = NULL, fill = "Correlation") +
+  labs(
+    title = "Correlation Among Numeric Predictors",
+    subtitle = "Values shown where |r| ≥ 0.9 (removed in preprocessing)",
+    x = NULL, y = NULL, fill = "Correlation"
+  ) +
   coord_fixed() +
   theme_minimal() +
   theme(axis.text.x = element_text(angle = 45, hjust = 1))
