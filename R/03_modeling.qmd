@@ -14,6 +14,7 @@ knitr::opts_chunk$set(echo = TRUE, message = FALSE, warning = FALSE)
 
 
 
+
 ## Load preprocessed splits
 
 ```{r load-data}
@@ -32,6 +33,7 @@ train_ref <- prep_obj$train
 
 
 
+
 ## Prepare feature matrices for train and validation
 
 ```{r prepare-features}
@@ -47,17 +49,14 @@ prepare_features <- function(train_reference, new_data, prep) {
 }
 
 val_metrics <- function(fit, x_val, y_val) {
-  if (!is.matrix(x_val)) {
-    x_val <- as.matrix(x_val)
-  }
-
   val_probs <- predict(fit, x_val, type = "prob")[, "Yes"]
+  pred_class <- predict(fit, x_val)
   y_factor <- factor(y_val, levels = c("No", "Yes"))
 
   tibble(
     roc_auc = yardstick::roc_auc_vec(y_factor, val_probs, event_level = "second"),
-    sens = yardstick::sensitivity_vec(y_factor, predict(fit, x_val), event_level = "second"),
-    spec = yardstick::specificity_vec(y_factor, predict(fit, x_val), event_level = "second")
+    sens = yardstick::sensitivity_vec(y_factor, pred_class, event_level = "second"),
+    spec = yardstick::specificity_vec(y_factor, pred_class, event_level = "second")
   ) |>
     mutate(across(where(is.numeric), as.numeric))
 }
@@ -100,6 +99,7 @@ cat("Validation features:", ncol(val_prep$x), "\n")
 
 
 
+
 ## Downsample training data for class imbalance
 
 ```{r downsample}
@@ -115,6 +115,7 @@ train_balanced |>
   count(readmit_30) |>
   mutate(pct = scales::percent(n / sum(n), accuracy = 0.1))
 ```
+
 
 
 
@@ -137,7 +138,8 @@ logistic_val
 
 
 
-## LASSO with validation tuning
+
+## glmnet with validation tuning (ridge, elastic net, LASSO)
 
 ```{r lasso}
 lasso_grid <- expand.grid(
@@ -163,9 +165,12 @@ lasso_val
 
 
 
+
 ## Random forest with validation tuning
 
 ```{r random-forest}
+set.seed(503)
+
 rf_grid <- expand.grid(
   mtry = c(100, 200),
   splitrule = "gini",
@@ -192,16 +197,18 @@ rf_val
 
 
 
+
 ## XGBoost with validation tuning
 
 ```{r xgboost}
 library(xgboost)
 
+set.seed(503)
+
 x_train <- train_balanced |> select(-readmit_30) |> as.matrix()
 y_train <- ifelse(train_balanced$readmit_30 == "Yes", 1, 0)
 x_val_mat <- as.matrix(val_prep$x)
 dtrain <- xgb.DMatrix(data = x_train, label = y_train)
-dval <- xgb.DMatrix(data = x_val_mat)
 
 xgb_grid <- expand.grid(
   nrounds = c(50, 100),
@@ -268,6 +275,7 @@ xgb_val
 
 
 
+
 ## Compare validation performance
 
 ```{r model-comparison}
@@ -280,6 +288,7 @@ val_metrics_all
 best_model_name <- val_metrics_all$model[1]
 cat("\nBest model on validation:", best_model_name, "\n")
 ```
+
 
 
 
@@ -301,6 +310,7 @@ xgb_tuned$results |>
   mutate(across(where(is.numeric), \(x) round(x, 4))) |>
   head(5)
 ```
+
 
 
 
@@ -343,17 +353,20 @@ ggsave("output/figures/13_roc_curves_validation.png", p_roc, width = 7, height =
 
 
 
+
 ## Feature importance (best model)
 
 ```{r feature-importance}
-best_model_obj <- switch(best_model_name,
-  "Logistic regression" = fit_logistic,
-  "LASSO"              = fit_lasso,
-  "Random forest"      = fit_rf,
-  NULL
+use_caret_importance <- best_model_name %in% c(
+  "Logistic regression", "LASSO", "Random forest"
 )
 
-if (!is.null(best_model_obj)) {
+if (use_caret_importance) {
+  best_model_obj <- switch(best_model_name,
+    "Logistic regression" = fit_logistic,
+    "LASSO"              = fit_lasso,
+    "Random forest"      = fit_rf
+  )
   imp <- varImp(best_model_obj, scale = TRUE)$importance |>
     rownames_to_column("feature") |>
     rename(importance = Overall) |>
@@ -370,7 +383,7 @@ if (!is.null(best_model_obj)) {
 
   print(p_imp)
   ggsave("output/figures/14_feature_importance.png", p_imp, width = 8, height = 7, dpi = 150)
-} else {
+} else if (best_model_name == "XGBoost") {
   xgb_imp <- xgb.importance(model = fit_xgb) |>
     as_tibble() |>
     slice_head(n = 20)
@@ -387,6 +400,7 @@ if (!is.null(best_model_obj)) {
   ggsave("output/figures/14_feature_importance.png", p_imp, width = 8, height = 7, dpi = 150)
 }
 ```
+
 
 
 
